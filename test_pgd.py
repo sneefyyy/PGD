@@ -120,24 +120,136 @@ def test_pgd_attack_initialization():
 
 
 def test_initialize_prompt():
-    """Test prompt initialization returns correct shape."""
+    """Test initialize_prompt produces a valid relaxed prompt matrix."""
     from pgd import PGDAttack
 
     attack = PGDAttack("gpt2")
     intent = "Test intent"
+    num_tokens = 20
 
-    adversarial_tokens = attack.initialize_prompt(intent, num_tokens=20)
+    X = attack.initialize_prompt(intent, num_tokens=num_tokens)
 
-    # Should return tensor with shape (num_tokens, vocab_size)
-    assert adversarial_tokens.shape == (20, attack.vocab_size), \
-        f"Expected shape (20, {attack.vocab_size}), got {adversarial_tokens.shape}"
+    # Tokenize intent exactly as initialize_prompt does
+    intent_ids = attack.tokenizer.encode(
+        intent,
+        add_special_tokens=False,
+    )
+    intent_len = len(intent_ids)
 
-    # Should be valid probability distributions
-    assert (adversarial_tokens >= 0).all(), "All values should be non-negative"
-    row_sums = adversarial_tokens.sum(dim=1)
-    assert torch.allclose(row_sums, torch.ones_like(row_sums), atol=1e-5), \
-        "Each row should sum to 1"
+    # 1. Shape check
+    expected_len = num_tokens + intent_len
+    assert X.shape == (expected_len, attack.vocab_size), (
+        f"Expected shape ({expected_len}, {attack.vocab_size}), "
+        f"got {tuple(X.shape)}"
+    )
 
+    # 2. All values non-negative
+    assert torch.all(X >= 0), "All entries should be non-negative"
+
+    # 3. Each row sums to 1 (simplex constraint)
+    row_sums = X.sum(dim=1)
+    assert torch.allclose(
+        row_sums,
+        torch.ones_like(row_sums),
+        atol=1e-5,
+    ), "Each row should sum to 1"
+
+    # 4. Soft prompt prefix should be uniform
+    prefix = X[:num_tokens]
+    expected_uniform = torch.full(
+        (attack.vocab_size,),
+        1.0 / attack.vocab_size,
+        device=X.device,
+    )
+    assert torch.allclose(
+        prefix,
+        expected_uniform.expand_as(prefix),
+        atol=1e-6,
+    ), "Soft prompt rows should be uniform distributions"
+
+    # 5. Intent rows should be one-hot at the correct token indices
+    intent_rows = X[num_tokens:]
+    intent_ids_tensor = torch.tensor(intent_ids, device=X.device)
+
+    # Max value per row should be exactly 1
+    max_vals, max_indices = intent_rows.max(dim=1)
+    assert torch.all(max_vals == 1.0), "Intent rows must be one-hot"
+
+    # Argmax should match tokenizer output
+    assert torch.all(
+        max_indices == intent_ids_tensor
+    ), "One-hot indices must match intent token IDs"
+
+def test_simplex_projection_raises_on_non_1d():
+    from pgd import PGDAttack
+    attack = PGDAttack("gpt2")
+
+    x = torch.randn(2, 3)
+    with pytest.raises(ValueError):
+        attack.simplex_projection(x)
+
+
+def test_simplex_projection_outputs_on_simplex():
+    from pgd import PGDAttack
+    attack = PGDAttack("gpt2")
+
+    v = torch.tensor([0.8, 0.3, -0.1], dtype=torch.float32)
+    p = attack.simplex_projection(v)
+
+    # Non-negative
+    assert torch.all(p >= 0), "Projection should be elementwise non-negative"
+
+    # Sums to 1
+    assert torch.isclose(p.sum(), torch.tensor(1.0), atol=1e-6), "Projection should sum to 1"
+
+
+def test_simplex_projection_known_example():
+    from pgd import PGDAttack
+    attack = PGDAttack("gpt2")
+
+    # Hand-checkable example
+    v = torch.tensor([0.8, 0.3, -0.1], dtype=torch.float32)
+    p = attack.simplex_projection(v)
+
+    # Expected result: subtract theta=0.05, clamp negatives
+    expected = torch.tensor([0.75, 0.25, 0.0], dtype=torch.float32)
+    assert torch.allclose(p, expected, atol=1e-6), f"Expected {expected}, got {p}"
+
+
+def test_simplex_projection_is_identity_on_simplex():
+    from pgd import PGDAttack
+    attack = PGDAttack("gpt2")
+
+    v = torch.tensor([0.2, 0.5, 0.3], dtype=torch.float32)  # already on simplex
+    p = attack.simplex_projection(v)
+
+    assert torch.allclose(p, v, atol=1e-6), "Projection should not change a vector already on the simplex"
+
+
+def test_simplex_projection_minimizes_distance_against_random_feasible_points():
+    """
+    This doesn't prove optimality, but it's a strong sanity check:
+    the projected point should be at least as close to v as many random simplex points.
+    """
+    from pgd import PGDAttack
+    attack = PGDAttack("gpt2")
+
+    torch.manual_seed(0)
+    v = torch.randn(10, dtype=torch.float32)  # arbitrary vector
+    p = attack.simplex_projection(v)
+
+    # Compare distance to random simplex samples
+    def sample_simplex(n, k):
+        # Dirichlet(1) gives uniform samples over simplex
+        return torch.distributions.Dirichlet(torch.ones(k)).sample((n,))
+
+    samples = sample_simplex(5000, v.numel())
+    d_proj = torch.norm(p - v).item()
+    d_samples = torch.norm(samples - v.unsqueeze(0), dim=1)
+
+    assert d_proj <= d_samples.min().item() + 1e-6, (
+        "Projected point should be at least as close as the best of many random feasible points"
+    )
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

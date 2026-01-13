@@ -16,11 +16,11 @@ class PGDAttack:
             model_name,
             torch_dtype=torch.float16 if self.device == "cuda" else torch.float32
         ).to(self.device)
-        self.model.eval()
+        self.model.eval() ## doesnt have initially
 
         self.learning_rate = 0.01
-        self.vocab_size = len(self.tokenizer)
-        self.entropy_threshold = 5.0
+        self.vocab_size = len(self.tokenizer) ## Doesnt have initially
+        self.entropy_threshold = 5.0 ## doesnt have initially
 
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -30,15 +30,52 @@ class PGDAttack:
             return json.load(f)
 
     def initialize_prompt(self, intent: str, num_tokens: int = 20) -> torch.Tensor:
-        # Initialize random tokens for the adversarial prefix and concatenate the random tokens to the intent string
-        # Create a probability distribution over the vocabulary for each adversarial token position
-        # Initialize with uniform distribution over all tokens
-        adversarial_probs = torch.ones(num_tokens, self.vocab_size, device=self.device) / self.vocab_size
-        return adversarial_probs
+        # 1. Soft prompt prefix: uniform distributions
+        adversarial_probs = torch.full(
+            (num_tokens, self.vocab_size),
+            fill_value=1.0 / self.vocab_size,
+            device=self.device,
+            dtype=torch.float32,
+        )
+
+        # 2. Tokenize intent
+        intent_ids = self.tokenizer.encode(
+            intent,
+            add_special_tokens=False,
+            return_tensors="pt",
+        ).to(self.device)
+
+        # 3. Convert intent tokens to one-hot (hard distributions)
+        intent_onehot = F.one_hot(
+            intent_ids.squeeze(0),
+            num_classes=self.vocab_size,
+        ).float()
+
+        # 4. Concatenate soft prefix + hard intent
+        X = torch.cat([adversarial_probs, intent_onehot], dim=0)
+
+        return X
 
     def simplex_projection(self, x: torch.Tensor) -> torch.Tensor:
-        # Project to simplex constraint
-        pass
+        if x.dim() != 1:
+            raise ValueError("x must be 1D")
+
+        # Sort descending
+        u, _ = torch.sort(x, descending=True)
+
+        # Cumulative sum minus 1
+        cssv = torch.cumsum(u, dim=0) - 1
+
+        # Find rho (last index where condition holds)
+        idx = torch.arange(1, x.shape[0] + 1, device=x.device, dtype=x.dtype)
+        cond = u - cssv / idx > 0
+        rho = torch.nonzero(cond, as_tuple=False).max()
+
+        # Compute theta
+        theta = cssv[rho] / (rho + 1)
+
+        # Project
+        return torch.clamp(x - theta, min=0)
 
     def entropy_projection(self, x: torch.Tensor) -> torch.Tensor:
         # Project to entropy constraint
