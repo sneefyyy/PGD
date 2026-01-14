@@ -18,12 +18,12 @@ class PGDAttack:
         ).to(self.device)
         self.model.eval() ## doesnt have initially
 
-        self.learning_rate = 2.0 # Lower for stability
+        self.learning_rate = 0.1 # Lower for stability
         self.vocab_size = len(self.tokenizer)
         # Tsallis entropy (q=2) threshold: bounded by [0, 1 - 1/K]
         # Lower values force more concentrated (peaked) distributions
         # 0.1 forces very peaked distributions (nearly one-hot)
-        self.entropy_threshold = 0.65
+        self.entropy_threshold = 0.8
 
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -219,83 +219,71 @@ class PGDAttack:
         return loss
 
     def optimize_attack(
-        self, intent: str, target: str, num_tokens: int = 20, num_iterations: int = 100
+        self, intent: str, target: str, num_tokens: int = 80, num_iterations: int = 3000
     ) -> str:
         """
         Main PGD optimization loop to find adversarial tokens.
-
-        Args:
-            intent: The malicious instruction
-            target: Desired model output
-            num_tokens: Number of adversarial tokens to optimize
-            num_iterations: Number of gradient descent steps
-
-        Returns:
-            String of adversarial text that, when prepended to intent,
-            causes model to output target
         """
-        # Initialize: soft adversarial tokens + one-hot intent tokens
-        adversarial_tokens = self.initialize_prompt(intent, num_tokens=num_tokens)
-
-        # Get the number of tokens we're actually optimizing (just the adversarial prefix)
+        # Initialize full tensor: soft prefix + hard intent
+        full_tokens = self.initialize_prompt(intent, num_tokens=num_tokens)
         num_adv_tokens = num_tokens
 
+        # ─── Key fix: make adv prefix a stable nn.Parameter ──────────────────────────
+        adv_prefix = torch.nn.Parameter(full_tokens[:num_adv_tokens])  # stable tensor to optimize
+        intent_part = full_tokens[num_adv_tokens:].detach()      # frozen, detached
+
+        optimizer = torch.optim.Adam([adv_prefix], lr=self.learning_rate)
+        # ──────────────────────────────────────────────────────────────────────────────
+
         for i in range(num_iterations):
-            # Enable gradients
-            adversarial_tokens = adversarial_tokens.detach().requires_grad_(True)
+            # Enable gradients on the parameter
+            adv_prefix.requires_grad_(True)
+
+            # Rebuild full input for loss: concat adv_prefix + intent_part
+            adversarial_tokens = torch.cat([adv_prefix, intent_part], dim=0)
 
             # Compute loss
             loss = self.compute_loss(adversarial_tokens, target)
 
-            # Backpropagate to get gradients
+            # Backpropagate
             loss.backward()
-            gradients = adversarial_tokens.grad
 
-            # Update only the adversarial tokens (not the intent tokens)
+            # Clip on the actual parameter
+            torch.nn.utils.clip_grad_norm_([adv_prefix], max_norm=20)
+
+            optimizer.step()
+            optimizer.zero_grad()
+
+            # Projections IN-PLACE on .data (no reassignment!)
             with torch.no_grad():
-                # Extract adversarial and intent parts
-                adv_part = adversarial_tokens[:num_adv_tokens]
-                intent_part = adversarial_tokens[num_adv_tokens:]
+                # Temporarily detach to modify data
+                adv_prefix_data = adv_prefix.data
 
-                # Gradient descent on adversarial part only
-                adv_grads = gradients[:num_adv_tokens]
-                adv_part = adv_part - self.learning_rate * adv_grads
-
-                torch.nn.utils.clip_grad_norm_(adversarial_tokens, max_norm=0.5)
-
-                # Apply projections row by row to adversarial tokens
                 projected_rows = []
-                for row in adv_part:
-                    # First project onto simplex
+                for row in adv_prefix_data:
                     row_proj = self.simplex_projection(row)
-                    # Then project onto entropy constraint
                     row_proj = self.entropy_projection(row_proj)
                     projected_rows.append(row_proj)
 
-                adv_part = torch.stack(projected_rows)
-
-                # Recombine adversarial + intent
-                adversarial_tokens = torch.cat([adv_part, intent_part], dim=0)
+                # Copy back in-place
+                adv_prefix.data.copy_(torch.stack(projected_rows))
 
             # Print progress with diagnostics
             if i % 50 == 0:
-                # Check distribution statistics
-                max_probs = adv_part.max(dim=1).values
-                entropies = -(adv_part * (adv_part + 1e-10).log()).sum(dim=1)
-
-                # Decode current best tokens
-                current_ids = adv_part.argmax(dim=1)
-                current_text = self.tokenizer.decode(current_ids, skip_special_tokens=True)
+                with torch.no_grad():
+                    max_probs = adv_prefix.max(dim=1).values
+                    entropies = -(adv_prefix * (adv_prefix + 1e-10).log()).sum(dim=1)
+                    current_ids = adv_prefix.argmax(dim=1)
+                    current_text = self.tokenizer.decode(current_ids, skip_special_tokens=True)
 
                 print(f"Iter {i}, Loss: {loss.item():.4f}, "
                       f"MaxProb: {max_probs.mean():.4f}, "
                       f"Entropy: {entropies.mean():.2f}")
                 print(f"  Current tokens: {current_text[:50]}...")
 
-        # Convert soft tokens to discrete tokens (argmax over vocabulary)
-        # Only decode the adversarial prefix part
+        # Discretize at the end
         with torch.no_grad():
-            token_ids = adversarial_tokens[:num_adv_tokens].argmax(dim=1)
+            token_ids = adv_prefix.argmax(dim=1)
             adversarial_text = self.tokenizer.decode(token_ids, skip_special_tokens=True)
 
         return adversarial_text
