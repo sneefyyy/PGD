@@ -125,9 +125,14 @@ def test_initialize_prompt():
 
     attack = PGDAttack("gpt2")
     intent = "Test intent"
-    num_tokens = 20
+    num_prefix_tokens = 20
+    num_suffix_tokens = 20
 
-    X = attack.initialize_prompt(intent, num_tokens=num_tokens)
+    prefix, intent_onehot, suffix = attack.initialize_prompt(
+        intent,
+        num_prefix_tokens=num_prefix_tokens,
+        num_suffix_tokens=num_suffix_tokens,
+    )
 
     # Tokenize intent exactly as initialize_prompt does
     intent_ids = attack.tokenizer.encode(
@@ -135,50 +140,31 @@ def test_initialize_prompt():
         add_special_tokens=False,
     )
     intent_len = len(intent_ids)
+    vocab_size = attack.vocab_size
 
-    # 1. Shape check
-    expected_len = num_tokens + intent_len
-    assert X.shape == (expected_len, attack.vocab_size), (
-        f"Expected shape ({expected_len}, {attack.vocab_size}), "
-        f"got {tuple(X.shape)}"
-    )
+    # 1. Shape checks for each component
+    assert prefix.shape == (num_prefix_tokens, vocab_size)
+    assert suffix.shape == (num_suffix_tokens, vocab_size)
+    assert intent_onehot.shape == (intent_len, vocab_size)
 
-    # 2. All values non-negative
-    assert torch.all(X >= 0), "All entries should be non-negative"
+    # 2. Probability simplex constraints on soft parts
+    for soft_block in (prefix, suffix):
+        assert torch.all(soft_block >= 0), "Soft blocks must be non-negative"
+        row_sums = soft_block.sum(dim=1)
+        assert torch.allclose(row_sums, torch.ones_like(row_sums), atol=1e-5), \
+            "Each soft row should sum to 1"
 
-    # 3. Each row sums to 1 (simplex constraint)
-    row_sums = X.sum(dim=1)
-    assert torch.allclose(
-        row_sums,
-        torch.ones_like(row_sums),
-        atol=1e-5,
-    ), "Each row should sum to 1"
-
-    # 4. Soft prompt prefix should be uniform
-    prefix = X[:num_tokens]
-    expected_uniform = torch.full(
-        (attack.vocab_size,),
-        1.0 / attack.vocab_size,
-        device=X.device,
-    )
-    assert torch.allclose(
-        prefix,
-        expected_uniform.expand_as(prefix),
-        atol=1e-6,
-    ), "Soft prompt rows should be uniform distributions"
-
-    # 5. Intent rows should be one-hot at the correct token indices
-    intent_rows = X[num_tokens:]
-    intent_ids_tensor = torch.tensor(intent_ids, device=X.device)
-
-    # Max value per row should be exactly 1
-    max_vals, max_indices = intent_rows.max(dim=1)
+    # 3. Intent rows should be one-hot at the correct token indices
+    intent_ids_tensor = torch.tensor(intent_ids, device=intent_onehot.device)
+    max_vals, max_indices = intent_onehot.max(dim=1)
     assert torch.all(max_vals == 1.0), "Intent rows must be one-hot"
+    assert torch.all(max_indices.cpu() == intent_ids_tensor.cpu()), \
+        "One-hot indices must match intent token IDs"
 
-    # Argmax should match tokenizer output
-    assert torch.all(
-        max_indices == intent_ids_tensor
-    ), "One-hot indices must match intent token IDs"
+    # 4. Components should be on the same device as the attack
+    expected_device = torch.device(attack.device)
+    for tensor in (prefix, intent_onehot, suffix):
+        assert tensor.device == expected_device, "Outputs must be on the model device"
 
 def test_simplex_projection_raises_on_non_1d():
     from pgd import PGDAttack
