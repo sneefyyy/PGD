@@ -102,7 +102,7 @@ class PGDAttack:
 
         return w.to(dtype=x.dtype)
 
-    def entropy_projection(self, s: torch.Tensor) -> torch.Tensor:
+    def entropy_projection(self, s: torch.Tensor, threshold: float) -> torch.Tensor:
         """
         Project onto entropy constraint using Tsallis entropy (Gini index) as per Algorithm 3 in the paper.
 
@@ -120,7 +120,7 @@ class PGDAttack:
 
         # Target Tsallis entropy S_{q=2} = 1 - sum(p_i^2)
         # self.entropy_threshold is used as the target S_{q=2}
-        S_q2 = self.entropy_threshold
+        S_q2 = threshold
 
         # Step 2: Center c = I[s>0] / sum(I[s>0]) - uniform over non-zero elements
         nonzero_mask = (s > 0).float()
@@ -217,9 +217,24 @@ class PGDAttack:
         )
 
         return loss
+    
+    def _maybe_clip_gradient(self, grad: torch.Tensor, grad_clip_strategy: str = 'token_norm', grad_clip_value: float = 20.0) -> torch.Tensor:
+        if grad_clip_strategy == 'token_norm':
+            for j in range(grad.shape[0]):
+                token_grad = grad[j]
+                norm = token_grad.norm()
+                if norm > grad_clip_value:
+                    grad[j] *= grad_clip_value / (norm + 1e-8)
+        elif grad_clip_strategy == 'norm':
+            norm = grad.norm()
+            if norm > grad_clip_value:
+                grad *= grad_clip_value / (norm + 1e-8)
+        elif grad_clip_strategy == 'value':
+            grad.clamp_(-grad_clip_value, grad_clip_value)
+        return grad
 
     def optimize_attack(
-        self, intent: str, target: str, num_tokens: int = 80, num_iterations: int = 3000
+        self, intent: str, target: str, num_tokens: int = 80, num_iterations: int = 200
     ) -> str:
         """
         Main PGD optimization loop to find adversarial tokens.
@@ -249,8 +264,7 @@ class PGDAttack:
             loss.backward()
 
             # Clip on the actual parameter
-            torch.nn.utils.clip_grad_norm_([adv_prefix], max_norm=20)
-
+            adv_prefix.grad = self._maybe_clip_gradient(adv_prefix.grad)
             optimizer.step()
             optimizer.zero_grad()
 
@@ -259,10 +273,11 @@ class PGDAttack:
                 # Temporarily detach to modify data
                 adv_prefix_data = adv_prefix.data
 
+                effective_threshold = self.entropy_threshold * min(1.0, i / 200.0)
                 projected_rows = []
                 for row in adv_prefix_data:
                     row_proj = self.simplex_projection(row)
-                    row_proj = self.entropy_projection(row_proj)
+                    row_proj = self.entropy_projection(row_proj, effective_threshold)
                     projected_rows.append(row_proj)
 
                 # Copy back in-place
