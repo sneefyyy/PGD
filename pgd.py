@@ -4,6 +4,8 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 import json
 import numpy as np
 
+from pgd_utils import get_nonascii_toks
+
 
 class PGDAttack:
     def __init__(self, model_name: str, device: str = "cuda"):
@@ -27,6 +29,9 @@ class PGDAttack:
 
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        # Get non-ASCII token indices to block during optimization
+        self.nonascii_toks = get_nonascii_toks(self.tokenizer, device=self.device)
 
     def load_intents(self, intents_file: str) -> list[dict]:
         with open(intents_file, "r") as f:
@@ -106,6 +111,16 @@ class PGDAttack:
             w = torch.full((n,), 1.0 / n, device=x.device, dtype=torch.float32)
 
         return w.to(dtype=x.dtype)
+
+    def filter_nonascii(self, probs: torch.Tensor) -> torch.Tensor:
+        """Zero out probabilities for non-ASCII tokens and renormalize."""
+        probs = probs.clone()
+        probs[self.nonascii_toks] = 0.0
+        # Renormalize to sum to 1
+        total = probs.sum()
+        if total > 0:
+            probs = probs / total
+        return probs
 
     def entropy_projection(self, s: torch.Tensor, entropy_factor: float) -> torch.Tensor:
         """
@@ -326,7 +341,8 @@ class PGDAttack:
                 # Project prefix
                 projected_prefix = []
                 for row in adv_prefix.data:
-                    row_proj = self.simplex_projection(row)
+                    row_proj = self.filter_nonascii(row)  # Block non-ASCII tokens
+                    row_proj = self.simplex_projection(row_proj)
                     row_proj = self.entropy_projection(row_proj, entropy_factor)
                     projected_prefix.append(row_proj)
                 adv_prefix.data.copy_(torch.stack(projected_prefix))
@@ -334,7 +350,8 @@ class PGDAttack:
                 # Project suffix
                 projected_suffix = []
                 for row in adv_suffix.data:
-                    row_proj = self.simplex_projection(row)
+                    row_proj = self.filter_nonascii(row)  # Block non-ASCII tokens
+                    row_proj = self.simplex_projection(row_proj)
                     row_proj = self.entropy_projection(row_proj, entropy_factor)
                     projected_suffix.append(row_proj)
                 adv_suffix.data.copy_(torch.stack(projected_suffix))
