@@ -18,12 +18,12 @@ class PGDAttack:
         ).to(self.device)
         self.model.eval() ## doesnt have initially
 
-        self.learning_rate = 0.1 # Lower for stability
+        self.learning_rate = 0.05 # Lower for stability
         self.vocab_size = len(self.tokenizer)
         # Tsallis entropy (q=2) threshold: bounded by [0, 1 - 1/K]
         # Lower values force more concentrated (peaked) distributions
         # 0.1 forces very peaked distributions (nearly one-hot)
-        self.entropy_threshold = 0.8
+        self.entropy_threshold = 0.4
 
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -32,32 +32,37 @@ class PGDAttack:
         with open(intents_file, "r") as f:
             return json.load(f)
 
-    def initialize_prompt(self, intent: str, num_tokens: int = 80) -> torch.Tensor:
-        # 1. Soft prompt prefix: uniform distributions
-        adversarial_probs = torch.full(
-            (num_tokens, self.vocab_size),
-            fill_value=1.0 / self.vocab_size,
+    def initialize_prompt(self, intent: str, num_prefix_tokens: int = 25, num_suffix_tokens: int = 25) -> tuple:
+        # 1. Soft prompt prefix: random distributions (normalized)
+        prefix_probs = torch.rand(
+            (num_prefix_tokens, self.vocab_size),
             device=self.device,
             dtype=torch.float32,
         )
+        prefix_probs = prefix_probs / prefix_probs.sum(dim=-1, keepdim=True)
 
-        # 2. Tokenize intent
+        # 2. Soft prompt suffix: random distributions (normalized)
+        suffix_probs = torch.rand(
+            (num_suffix_tokens, self.vocab_size),
+            device=self.device,
+            dtype=torch.float32,
+        )
+        suffix_probs = suffix_probs / suffix_probs.sum(dim=-1, keepdim=True)
+
+        # 3. Tokenize intent
         intent_ids = self.tokenizer.encode(
             intent,
             add_special_tokens=False,
             return_tensors="pt",
         ).to(self.device)
 
-        # 3. Convert intent tokens to one-hot (hard distributions)
+        # 4. Convert intent tokens to one-hot (hard distributions)
         intent_onehot = F.one_hot(
             intent_ids.squeeze(0),
             num_classes=self.vocab_size,
         ).float()
 
-        # 4. Concatenate soft prefix + hard intent
-        X = torch.cat([adversarial_probs, intent_onehot], dim=0)
-
-        return X
+        return prefix_probs, intent_onehot, suffix_probs
 
     def simplex_projection(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() != 1:
@@ -102,15 +107,18 @@ class PGDAttack:
 
         return w.to(dtype=x.dtype)
 
-    def entropy_projection(self, s: torch.Tensor, threshold: float) -> torch.Tensor:
+    def entropy_projection(self, s: torch.Tensor, entropy_factor: float) -> torch.Tensor:
         """
-        Project onto entropy constraint using Tsallis entropy (Gini index) as per Algorithm 3 in the paper.
+        Project onto entropy constraint using Tsallis entropy (Gini index) as per the reference implementation.
 
         Uses geometric projection onto a hypersphere defined by the Gini index,
         then re-projects onto simplex if needed.
 
         Args:
             s: 1D tensor representing a relaxed token distribution in [0,1]^|T|
+            entropy_factor: Value in [0, 1] controlling entropy constraint strength.
+                           0 = no constraint (max entropy allowed)
+                           1 = strictest constraint (min entropy, peaked distributions)
 
         Returns:
             Projected distribution with bounded Tsallis entropy (q=2)
@@ -118,39 +126,49 @@ class PGDAttack:
         if s.dim() != 1:
             raise ValueError("s must be 1D")
 
-        # Target Tsallis entropy S_{q=2} = 1 - sum(p_i^2)
-        # self.entropy_threshold is used as the target S_{q=2}
-        S_q2 = threshold
-
-        # Step 2: Center c = I[s>0] / sum(I[s>0]) - uniform over non-zero elements
-        nonzero_mask = (s > 0).float()
-        num_nonzero = nonzero_mask.sum().item()  # Extract scalar for comparisons
-
-        if num_nonzero == 0:
+        # If entropy_factor is 0, no projection needed
+        if entropy_factor <= 0:
             return s
 
-        c = nonzero_mask / num_nonzero
+        # Count non-zero elements (d in the reference)
+        nonzero_mask = (s > 0).float()
+        d = nonzero_mask.sum().item()
 
-        # Step 3: Radius R = sqrt(1 - S_{q=2} - 1/sum(I[s>0]))
-        R_squared = 1.0 - S_q2 - 1.0 / num_nonzero
+        if d == 0:
+            return s
 
-        # If R^2 <= 0, the constraint is impossible to satisfy, return s as-is
+        # Target entropy: (1 - entropy_factor) * (d - 1) / d
+        # This means:
+        #   entropy_factor=0 -> target_entropy = (d-1)/d (max allowed, uniform-ish)
+        #   entropy_factor=1 -> target_entropy = 0 (min allowed, one-hot)
+        target_entropy = (1 - entropy_factor) * (d - 1) / d
+
+        # Center c = uniform over non-zero elements
+        c = nonzero_mask / d
+
+        # Radius R = sqrt(1 - target_entropy - 1/d)
+        # Note: 1 - target_entropy - 1/d = 1 - (1 - entropy_factor)*(d-1)/d - 1/d
+        #     = 1 - (d-1)/d + entropy_factor*(d-1)/d - 1/d
+        #     = 1 - (d-1)/d - 1/d + entropy_factor*(d-1)/d
+        #     = entropy_factor * (d-1)/d
+        R_squared = 1.0 - target_entropy - 1.0 / d
+
         if R_squared <= 0:
             return s
 
-        R = torch.sqrt(torch.tensor(R_squared, device=s.device))
+        R = np.sqrt(R_squared)
 
-        # Step 4-7: Check if projection is needed
-        dist_to_center = torch.norm(s - c).item()  # Extract scalar for comparison
+        # Distance from s to center
+        direction = s - c
+        dist_to_center = torch.norm(direction).item()
 
-        if R.item() >= dist_to_center:
-            # Already inside the entropy ball, return as-is
+        # If already inside the entropy ball, return as-is
+        if R >= dist_to_center:
             return s
-        else:
-            # Project onto the hypersphere surface, then re-project to simplex
-            # s_proj = R / ||s - c|| * (s - c) + c
-            s_proj = (R / dist_to_center) * (s - c) + c
-            return self.simplex_projection(s_proj)
+
+        # Project onto the hypersphere surface, then re-project to simplex
+        s_proj = (R / dist_to_center) * direction + c
+        return self.simplex_projection(s_proj)
 
     def compute_loss(
         self, adversarial_tokens: torch.Tensor, target_text: str
@@ -169,51 +187,49 @@ class PGDAttack:
         Returns:
             Cross-entropy loss (scalar tensor)
         """
-        # Get embedding matrix: (vocab_size, embed_dim)
         embedding_layer = self.model.get_input_embeddings()
         embedding_matrix = embedding_layer.weight
 
-        # Compute soft embeddings: weighted sum over vocabulary
-        # adversarial_tokens: (L, vocab_size) @ embedding_matrix: (vocab_size, embed_dim) -> (L, embed_dim)
-        # Cast to match embedding matrix dtype (float16 on CUDA)
         soft_embeddings = adversarial_tokens.to(embedding_matrix.dtype) @ embedding_matrix
 
-        # Tokenize target text
-        target_ids = self.tokenizer.encode(
-            target_text,
-            add_special_tokens=False,
-            return_tensors="pt",
-        ).to(self.device)
+        target_ids = self.tokenizer.encode(target_text, add_special_tokens=False, return_tensors="pt").to(self.device)
 
-        # Get target embeddings
-        target_embeddings = embedding_layer(target_ids)  # (1, target_len, embed_dim)
+        target_embeddings = embedding_layer(target_ids)
 
-        # Concatenate: [soft prompt + intent embeddings] + [target embeddings]
-        # soft_embeddings: (L, embed_dim) -> (1, L, embed_dim)
-        # target_embeddings: (1, target_len, embed_dim)
-        combined_embeddings = torch.cat([
-            soft_embeddings.unsqueeze(0),
-            target_embeddings
-        ], dim=1)  # (1, L + target_len, embed_dim)
+        combined_embeddings = torch.cat([soft_embeddings.unsqueeze(0), target_embeddings], dim=1)
 
-        # Forward pass through model with embeddings directly
         outputs = self.model(inputs_embeds=combined_embeddings)
-        logits = outputs.logits  # (1, L + target_len, vocab_size)
+        logits = outputs.logits
 
-        # Compute loss on target positions only
-        # The logits at position i predict token i+1
-        # So logits at positions [L-1, L, ..., L+target_len-2] predict target tokens
         num_prompt_tokens = adversarial_tokens.shape[0]
         target_len = target_ids.shape[1]
 
-        # Get logits that predict target tokens (shift by 1)
-        # logits[:, num_prompt_tokens-1 : num_prompt_tokens-1+target_len] predict target
         target_logits = logits[:, num_prompt_tokens - 1 : num_prompt_tokens - 1 + target_len, :]
 
-        # Compute cross-entropy loss
-        loss = -F.cross_entropy(
-            target_logits.reshape(-1, self.vocab_size),
-            target_ids.reshape(-1)
+        # Main target loss
+        target_loss = F.cross_entropy(target_logits.reshape(-1, self.vocab_size), target_ids.reshape(-1))
+
+        # Control loss on prefix (low perplexity)
+        prefix_logits = logits[:, :num_prompt_tokens-1, :]  # predict prefix tokens
+        prefix_factors = adversarial_tokens[:num_prompt_tokens-1, :]  # soft probs
+        control_loss_forward = F.cross_entropy(prefix_logits.reshape(-1, self.vocab_size),
+                                            prefix_factors.transpose(0,1).detach().reshape(-1, self.vocab_size),
+                                            reduction='none').mean()
+
+        # Optional: backward direction
+        control_loss_backward = F.cross_entropy(prefix_logits.detach().reshape(-1, self.vocab_size),
+                                                prefix_factors.reshape(-1, self.vocab_size),
+                                                reduction='none').mean()
+
+        # Soft entropy
+        entropy = - (adversarial_tokens * torch.log(adversarial_tokens + 1e-10)).sum(-1).mean()
+
+        # Weighted combination
+        loss = (
+            target_loss * 0.84 + 
+            0.007 * control_loss_forward + 
+            0.05 * control_loss_backward + 
+            0.0002 * entropy
         )
 
         return loss
@@ -234,28 +250,38 @@ class PGDAttack:
         return grad
 
     def optimize_attack(
-        self, intent: str, target: str, num_tokens: int = 80, num_iterations: int = 200
-    ) -> str:
+        self, intent: str, target: str, num_prefix_tokens: int = 25, num_suffix_tokens: int = 25, num_iterations: int = 200
+    ) -> tuple:
         """
         Main PGD optimization loop to find adversarial tokens.
+
+        Returns:
+            tuple: (prefix_text, suffix_text) - the optimized adversarial prefix and suffix
         """
-        # Initialize full tensor: soft prefix + hard intent
-        full_tokens = self.initialize_prompt(intent, num_tokens=num_tokens)
-        num_adv_tokens = num_tokens
+        # Initialize: soft prefix + hard intent + soft suffix
+        prefix_probs, intent_onehot, suffix_probs = self.initialize_prompt(
+            intent, num_prefix_tokens=num_prefix_tokens, num_suffix_tokens=num_suffix_tokens)
 
-        # ─── Key fix: make adv prefix a stable nn.Parameter ──────────────────────────
-        adv_prefix = torch.nn.Parameter(full_tokens[:num_adv_tokens])  # stable tensor to optimize
-        intent_part = full_tokens[num_adv_tokens:].detach()      # frozen, detached
+        # Make prefix and suffix parameters to optimize
+        adv_prefix = torch.nn.Parameter(prefix_probs)
+        adv_suffix = torch.nn.Parameter(suffix_probs)
+        intent_part = intent_onehot.detach()  # frozen
 
-        optimizer = torch.optim.Adam([adv_prefix], lr=self.learning_rate)
-        # ──────────────────────────────────────────────────────────────────────────────
+        optimizer = torch.optim.Adam([adv_prefix, adv_suffix], lr=self.learning_rate)
+
+        best_loss = float('inf')
+        best_prefix = adv_prefix.data.clone()
+        best_suffix = adv_suffix.data.clone()
+        patience = 0
+        max_patience = 300
 
         for i in range(num_iterations):
-            # Enable gradients on the parameter
+            # Enable gradients
             adv_prefix.requires_grad_(True)
+            adv_suffix.requires_grad_(True)
 
-            # Rebuild full input for loss: concat adv_prefix + intent_part
-            adversarial_tokens = torch.cat([adv_prefix, intent_part], dim=0)
+            # Rebuild full input: prefix + intent + suffix
+            adversarial_tokens = torch.cat([adv_prefix, intent_part, adv_suffix], dim=0)
 
             # Compute loss
             loss = self.compute_loss(adversarial_tokens, target)
@@ -263,60 +289,98 @@ class PGDAttack:
             # Backpropagate
             loss.backward()
 
-            # Clip on the actual parameter
-            adv_prefix.grad = self._maybe_clip_gradient(adv_prefix.grad)
+            if loss.item() < best_loss:
+                best_loss = loss.item()
+                best_prefix = adv_prefix.data.clone()
+                best_suffix = adv_suffix.data.clone()
+                patience = 0
+            else:
+                patience += 1
+                if patience > max_patience:
+                    print(f"Iter {i}: Reverting to best")
+                    adv_prefix.data.copy_(best_prefix)
+                    adv_suffix.data.copy_(best_suffix)
+                    patience = 0
+                    if adv_prefix.grad is not None:
+                        adv_prefix.grad.zero_()
+                    if adv_suffix.grad is not None:
+                        adv_suffix.grad.zero_()
+
+            # Clip gradients
+            if adv_prefix.grad is not None:
+                adv_prefix.grad = self._maybe_clip_gradient(adv_prefix.grad)
+            if adv_suffix.grad is not None:
+                adv_suffix.grad = self._maybe_clip_gradient(adv_suffix.grad)
+
             optimizer.step()
             optimizer.zero_grad()
 
-            # Projections IN-PLACE on .data (no reassignment!)
+            # Projections IN-PLACE on .data
             with torch.no_grad():
-                # Temporarily detach to modify data
-                adv_prefix_data = adv_prefix.data
+                # Anneal entropy_factor from 0 to end_entropy_factor over anneal_duration steps
+                anneal_duration = 250
+                init_entropy_factor = 0.0
+                end_entropy_factor = self.entropy_threshold  # 0.4
+                entropy_factor = init_entropy_factor + (end_entropy_factor - init_entropy_factor) * min(1.0, i / anneal_duration)
 
-                effective_threshold = self.entropy_threshold * min(1.0, i / 200.0)
-                projected_rows = []
-                for row in adv_prefix_data:
+                # Project prefix
+                projected_prefix = []
+                for row in adv_prefix.data:
                     row_proj = self.simplex_projection(row)
-                    row_proj = self.entropy_projection(row_proj, effective_threshold)
-                    projected_rows.append(row_proj)
+                    row_proj = self.entropy_projection(row_proj, entropy_factor)
+                    projected_prefix.append(row_proj)
+                adv_prefix.data.copy_(torch.stack(projected_prefix))
 
-                # Copy back in-place
-                adv_prefix.data.copy_(torch.stack(projected_rows))
+                # Project suffix
+                projected_suffix = []
+                for row in adv_suffix.data:
+                    row_proj = self.simplex_projection(row)
+                    row_proj = self.entropy_projection(row_proj, entropy_factor)
+                    projected_suffix.append(row_proj)
+                adv_suffix.data.copy_(torch.stack(projected_suffix))
 
             # Print progress with diagnostics
             if i % 50 == 0:
                 with torch.no_grad():
-                    max_probs = adv_prefix.max(dim=1).values
-                    entropies = -(adv_prefix * (adv_prefix + 1e-10).log()).sum(dim=1)
-                    current_ids = adv_prefix.argmax(dim=1)
-                    current_text = self.tokenizer.decode(current_ids, skip_special_tokens=True)
+                    all_adv = torch.cat([adv_prefix, adv_suffix], dim=0)
+                    max_probs = all_adv.max(dim=1).values
+                    entropies = -(all_adv * (all_adv + 1e-10).log()).sum(dim=1)
+
+                    prefix_ids = adv_prefix.argmax(dim=1)
+                    suffix_ids = adv_suffix.argmax(dim=1)
+                    prefix_text = self.tokenizer.decode(prefix_ids, skip_special_tokens=True)
+                    suffix_text = self.tokenizer.decode(suffix_ids, skip_special_tokens=True)
 
                 print(f"Iter {i}, Loss: {loss.item():.4f}, "
                       f"MaxProb: {max_probs.mean():.4f}, "
                       f"Entropy: {entropies.mean():.2f}")
-                print(f"  Current tokens: {current_text[:50]}...")
+                print(f"  Prefix: {prefix_text[:30]}...")
+                print(f"  Suffix: {suffix_text[:30]}...")
 
         # Discretize at the end
         with torch.no_grad():
-            token_ids = adv_prefix.argmax(dim=1)
-            adversarial_text = self.tokenizer.decode(token_ids, skip_special_tokens=True)
+            prefix_ids = adv_prefix.argmax(dim=1)
+            suffix_ids = adv_suffix.argmax(dim=1)
+            prefix_text = self.tokenizer.decode(prefix_ids, skip_special_tokens=True)
+            suffix_text = self.tokenizer.decode(suffix_ids, skip_special_tokens=True)
 
-        return adversarial_text
+        return prefix_text, suffix_text
 
-    def evaluate_attack(self, adversarial_prompt: str, intent: str, target: str) -> bool:
+    def evaluate_attack(self, prefix: str, suffix: str, intent: str, target: str) -> bool:
         """
         Check if the attack was successful by generating from the model.
 
         Args:
-            adversarial_prompt: The optimized adversarial text
+            prefix: The optimized adversarial prefix
+            suffix: The optimized adversarial suffix
             intent: The original malicious instruction
             target: Expected model output
 
         Returns:
             True if attack succeeded (model generates target-like text), False otherwise
         """
-        # Combine adversarial prompt with intent
-        full_input = adversarial_prompt + " " + intent
+        # Combine: prefix + intent + suffix
+        full_input = prefix + " " + intent + " " + suffix
 
         # Tokenize
         inputs = self.tokenizer(full_input, return_tensors="pt").to(self.device)
@@ -370,15 +434,16 @@ def main():
             intent = intent_data["intent"]
             target = intent_data["target"]
 
-            adversarial_prompt = attack.optimize_attack(intent, target, num_iterations=1000)
-            success = attack.evaluate_attack(adversarial_prompt, intent, target)
+            prefix, suffix = attack.optimize_attack(intent, target, num_iterations=500)
+            success = attack.evaluate_attack(prefix, suffix, intent, target)
 
             if success:
                 successes += 1
 
             print(f"Intent: {intent}")
             print(f"Success: {success}")
-            print(f"Adversarial prompt: {adversarial_prompt}")
+            print(f"Adversarial prefix: {prefix}")
+            print(f"Adversarial suffix: {suffix}")
             print("-" * 50)
 
         # Print accuracy for this model
