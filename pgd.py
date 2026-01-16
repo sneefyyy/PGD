@@ -90,7 +90,7 @@ class PGDAttack:
         # Work in float32 for numerical stability, then cast back
         x0 = x.to(torch.float32)
 
-        n = x0.numel()
+        n = x0.numel() ## number of values
 
         u, _ = torch.sort(x0, descending=True)
         cssv = torch.cumsum(u, dim=0) - 1.0
